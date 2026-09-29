@@ -114,19 +114,27 @@ def render_toolbar() -> tuple[bc.RouteRequest | None, Options]:
     return bc.parse_brouter_url(url), options
 
 
-def render_stats(s: bc.RouteSummary) -> None:
+def render_stats(a: bc.RouteAnalysis) -> None:
+    s = a.summary
+    trail = bc.estimate_trail_time(a)
+    adjust = f"{trail.adjust_min:+.0f} min" if trail.adjust_min else "nessuna correzione"
     stats = (
         ("Distanza", f"{bc.fmt_num(s.length_m / 1000, 1)} km"),
-        ("Tempo", bc.fmt_duration(s.total_time_s)),
+        ("Tempo camminata", bc.fmt_duration(s.total_time_s)),
+        ("Tempo trail", bc.fmt_duration(trail.seconds),
+         f"Metà del tempo di camminata ({bc.fmt_duration(trail.base_seconds)}), {adjust} per le salite ripide: "
+         f"{bc.fmt_num(trail.steep_ascent_m)} m di dislivello su salite con pendenza media di almeno {bc.fmt_num(bc.STEEP_GRADE_PCT)}%."),
         ("Salita | Salita piana", f"{bc.fmt_num(s.ascend_m)} m | {bc.fmt_num(s.plain_ascend_m)} m"),
         ("Discesa", f"{bc.fmt_num(s.descend_m)} m"),
         ("Quota min – max", f"{bc.fmt_num(s.ele_min)} – {bc.fmt_num(s.ele_max)} m"),
         ("Energia", f"{bc.fmt_num(s.energy_kwh, 2)} kWh"),
         ("Costo | Fattore medio", f"{bc.fmt_num(s.cost)} | {bc.fmt_num(s.mean_cost_factor, 2)}"),
     )
+    # Il terzo elemento, se presente, è il tooltip che spiega il calcolo
     cells = "".join(
-        f'<div class="br-stat"><div class="label">{label}</div><div class="value">{value}</div></div>'
-        for label, value in stats
+        f'<div class="br-stat" title="{html.escape(stat[2]) if len(stat) > 2 else ""}">'
+        f'<div class="label">{stat[0]}{" ⓘ" if len(stat) > 2 else ""}</div><div class="value">{stat[1]}</div></div>'
+        for stat in stats
     )
     st.markdown(f'<div class="br-stats">{cells}</div>', unsafe_allow_html=True)
 
@@ -321,13 +329,25 @@ def build_weather_chart(info: wx.WeatherInfo) -> go.Figure:
     return fig
 
 
+def _store_key() -> None:
+    # Copio il valore fuori dal widget: Streamlit cancella lo stato dei widget non più mostrati,
+    # e il campo sparisce appena la chiave è valida
+    st.session_state["gemini_api_key"] = st.session_state.get("gemini_key_input", "").strip()
+
+
 def render_coach(a: bc.RouteAnalysis, climbs: pd.DataFrame, weather: wx.WeatherInfo | None) -> None:
-    api_key = gc.resolve_api_key(_secret_key(), st.session_state.get("gemini_key"))
+    secret = _secret_key()
+    api_key = gc.resolve_api_key(secret, st.session_state.get("gemini_api_key"))
     if api_key is None:
         st.markdown(f"Per i consigli serve una chiave gratuita di Google AI Studio: "
                     f"[creala qui]({gc.API_KEY_URL}), poi incollala sotto. Resta solo in questa sessione.")
-        st.text_input("Chiave API Gemini", type="password", key="gemini_key")
+        st.text_input("Chiave API Gemini", type="password", key="gemini_key_input", on_change=_store_key)
         return
+    if not secret and st.session_state.get("gemini_api_key"):
+        # Chiave inserita a mano: permetto di cambiarla (es. se Gemini la rifiuta)
+        if st.button("Cambia chiave"):
+            st.session_state.pop("gemini_api_key", None)
+            st.rerun()
 
     c_act, c_lvl, c_go = st.columns([2, 2, 1.2], vertical_alignment="bottom")
     activity = c_act.selectbox("Attività", gc.ACTIVITIES)
@@ -419,7 +439,7 @@ def render_results(a: bc.RouteAnalysis, options: Options) -> None:
         st.markdown(bc.narrative(a, options.climb_threshold_m))
         render_surface_legend(bc.breakdown(a.steps, "fondo"))
 
-    render_stats(a.summary)
+    render_stats(a)
     st.plotly_chart(build_elevation_chart(a, climbs), config={"displayModeBar": False})
 
     tab_climb, tab_weather, tab_coach, tab_seg, tab_way, tab_raw = st.tabs(

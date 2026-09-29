@@ -88,6 +88,7 @@ Regole:
   (corri, cammina, alterna, scendi con cautela) adatta all'attività e al livello indicati,
   considerando pendenza media, punte, lunghezza e fondo. Motivo in una frase.
 - Alimentazione: stima prima la durata per l'attività e il livello indicati (scrivila nella sintesi).
+  Per il trail running parti da tempo_trail_stimato (riferito a un livello intermedio) e adattalo al livello.
   Sotto i 60 minuti non proporre gel, al massimo acqua. Sopra, colloca gel e acqua a km precisi,
   preferibilmente prima delle salite più dure o in tratti facili dove è comodo farlo.
 - Pioggia: consiglia il tipo di scarpa (tassellatura, mescola, drop, protezione) in base al mix di fondi
@@ -146,6 +147,7 @@ def build_context(analysis: bc.RouteAnalysis, climbs: pd.DataFrame, weather: dic
             "quota_max_m": _r(s.ele_max),
             "pendenza_max_pct": _r(s.max_grade_pct, 1),
             "tempo_brouter_a_piedi": bc.fmt_duration(s.total_time_s),
+            "tempo_trail_stimato": bc.fmt_duration(bc.estimate_trail_time(analysis).seconds),
         },
         "fondo_percentuali": [
             {"fondo": r.fondo, "km": _r(r.km, 2), "pct": _r(r.pct, 1), "km_dedotti": _r(r.dedotto_m / 1000, 2)}

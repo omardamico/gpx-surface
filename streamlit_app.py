@@ -34,4 +34,3 @@ if __name__ == "__main__":
         "--theme.secondaryBackgroundColor=#f8f9fa",
         "--theme.textColor=#212529",
     ]
-    sys.exit(stcli.main())

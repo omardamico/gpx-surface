@@ -66,6 +66,12 @@ CLIMB_PEAK_WINDOW = 5
 FLAT_TOLERANCE_M = 2.0
 MIN_FLAT_M = 300
 
+# Stima tempo trail: metà del tempo a piedi, corretta di ±10 min in base alle salite ripide
+TRAIL_TIME_FACTOR = 0.5
+STEEP_GRADE_PCT = 8.0
+STEEP_NEUTRAL_M_PER_KM = 20.0
+TRAIL_MAX_ADJUST_MIN = 10.0
+
 _SURFACE_MAP = {
     **dict.fromkeys(("asphalt", "paved", "concrete", "concrete:plates", "concrete:lanes",
                      "chipseal", "metal", "wood", "tartan", "rubber", "acrylic"), ASFALTO),
@@ -674,6 +680,38 @@ def _dominant_surface(steps: pd.DataFrame, km_start: float, km_end: float) -> st
     return " e ".join(f"{name.lower()} ({fmt_num(pct)}%)" for name, pct in shares.iloc[:2].items())
 
 
+
+@dataclass(frozen=True)
+class TrailEstimate:
+    """Tempo di corsa stimato: base = camminata x TRAIL_TIME_FACTOR, più la correzione per le salite."""
+    seconds: float
+    base_seconds: float
+    adjust_min: float
+    steep_ascent_m: float
+
+
+def estimate_trail_time(analysis: RouteAnalysis) -> TrailEstimate:
+    """
+    Metà del tempo a piedi di BRouter, corretta tra -10 e +10 minuti.
+
+    La correzione dipende dal dislivello fatto su salite con pendenza media >= STEEP_GRADE_PCT,
+    rapportato ai km: 0 m/km -> -10 min, 20 m/km -> 0, da 40 m/km in su -> +10 min.
+    """
+    s = analysis.summary
+    base = s.total_time_s * TRAIL_TIME_FACTOR if np.isfinite(s.total_time_s) else float("nan")
+
+    # Soglia fissa: la stima non deve cambiare muovendo lo slider delle salite nella UI
+    climbs = detect_climbs(analysis.track, analysis.steps, CLIMB_THRESHOLD_M)
+    steep = climbs[(climbs["tipo"] == "salita") & (climbs["pendenza_media"] >= STEEP_GRADE_PCT)]
+    steep_m = float(steep["dz"].sum()) if not steep.empty else 0.0
+
+    km = s.length_m / 1000
+    ratio = (steep_m / km - STEEP_NEUTRAL_M_PER_KM) / STEEP_NEUTRAL_M_PER_KM if km > 0 else -1.0
+    adjust_min = round(float(np.clip(ratio, -1, 1)) * TRAIL_MAX_ADJUST_MIN)
+    return TrailEstimate(seconds=max(base + adjust_min * 60, 0.0) if np.isfinite(base) else base,
+                         base_seconds=base, adjust_min=adjust_min, steep_ascent_m=steep_m)
+
+
 # ----------------------------------------------------------------------------------------
 # Testo riepilogativo
 # ----------------------------------------------------------------------------------------
@@ -754,7 +792,8 @@ def narrative(analysis: RouteAnalysis, climb_threshold_m: float = CLIMB_THRESHOL
         f"di dislivello positivo e **{fmt_num(s.descend_m)} m** negativo. "
         f"La quota varia tra {fmt_num(s.ele_min)} e {fmt_num(s.ele_max)} m, "
         f"con pendenza massima intorno al {fmt_num(s.max_grade_pct)}%. "
-        f"Tempo stimato a passo di camminata: **{fmt_duration(s.total_time_s)}**.",
+        f"Tempo stimato: **{fmt_duration(s.total_time_s)}** camminando, "
+        f"circa **{fmt_duration(estimate_trail_time(analysis).seconds)}** di corsa trail.",
         "Fondo: " + ", ".join(
             f"{r.fondo.lower()} **{fmt_num(r.pct)}%** ({fmt_num(r.km, 1)} km)" for r in surfaces.itertuples()
         ) + ".",
