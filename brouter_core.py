@@ -4,25 +4,34 @@ Integrazione con BRouter (https://brouter.de) e analisi del fondo di un percorso
 Il routing è delegato all'API pubblica di BRouter: la risposta GeoJSON contiene nella
 property "messages" la stessa tabella del pannello "Data" di BRouter-Web (una riga per
 tratto omogeneo, con WayTags OSM, quota, distanza, costi, tempo ed energia).
-Il bosco non è presente nei WayTags, quindi viene ricavato da OpenStreetMap via Overpass
-(aree landuse=forest / natural=wood).
+Il bosco non è presente nei WayTags, quindi viene ricavato da OpenStreetMap: con una sola query
+Overpass scarico i poligoni landuse=forest / natural=wood attorno al percorso e verifico in locale
+quali punti della traccia ci cadono dentro.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from itertools import accumulate
 from urllib.parse import parse_qs, urlparse
 
 import gpxpy
 import numpy as np
 import pandas as pd
 import requests
+import shapely
 from requests.adapters import HTTPAdapter
+from shapely.geometry import LineString, Polygon
+from shapely.ops import polygonize, unary_union
 from urllib3.util.retry import Retry
 
 BROUTER_API = "https://brouter.de/brouter"
-OVERPASS_API = "https://overpass-api.de/api/interpreter"
+# Istanze pubbliche Overpass: se una rifiuta la connessione o è sovraccarica passo alla successiva
+OVERPASS_ENDPOINTS = (
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+)
 USER_AGENT = "gpx-surface-analyzer/1.0 (+https://brouter.de)"
 
 MAX_WAYPOINTS = 200
@@ -32,7 +41,7 @@ FOOT_PROFILE = "hiking-mountain"
 
 FOREST_SAMPLE_M = 50
 FOREST_MAX_SAMPLES = 600
-OVERPASS_CHUNK = 150
+FOREST_BBOX_PAD_DEG = 0.002
 
 EARTH_RADIUS_M = 6_371_008.8
 
@@ -246,9 +255,9 @@ def _cumulative_m(lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
 # Chiamate esterne
 # ----------------------------------------------------------------------------------------
 
-def http_session() -> requests.Session:
+def http_session(retries: int = 3) -> requests.Session:
     # Retry con backoff esponenziale sugli errori transitori e sul rate limit
-    retry = Retry(total=3, backoff_factor=1.5, status_forcelist=(429, 502, 503, 504),
+    retry = Retry(total=retries, backoff_factor=1.5, status_forcelist=(429, 502, 503, 504),
                   allowed_methods=("GET", "POST"), raise_on_status=False)
     session = requests.Session()
     session.headers["User-Agent"] = USER_AGENT
@@ -289,9 +298,9 @@ def fetch_route(req: RouteRequest) -> dict:
 
 def detect_forest(track: pd.DataFrame) -> ForestInfo:
     """
-    Campiona la traccia e verifica per ogni punto se cade in un'area boscata OSM.
+    Campiona la traccia ogni ~50 m e verifica quali punti cadono in un'area boscata OSM.
 
-    @throws BRouterError se Overpass non è disponibile
+    @throws BRouterError se nessuna istanza Overpass risponde
     """
     total_km = float(track["km"].iloc[-1])
     spacing_km = max(FOREST_SAMPLE_M, total_km * 1000 / FOREST_MAX_SAMPLES) / 1000
@@ -302,12 +311,14 @@ def detect_forest(track: pd.DataFrame) -> ForestInfo:
         "lat": np.interp(km, track["km"], track["lat"]),
     })
 
-    session = http_session()
-    forest_idx = set().union(*(
-        _query_forest(session, samples.iloc[start:start + OVERPASS_CHUNK])
-        for start in range(0, len(samples), OVERPASS_CHUNK)
-    ))
-    flags = samples.index.isin(forest_idx)
+    pad = FOREST_BBOX_PAD_DEG
+    bbox = (track["lat"].min() - pad, track["lon"].min() - pad, track["lat"].max() + pad, track["lon"].max() + pad)
+    forest = forest_geometry(_fetch_forest_elements(bbox))
+    if forest is None:
+        flags = np.zeros(len(samples), dtype=bool)
+    else:
+        shapely.prepare(forest)
+        flags = shapely.contains_xy(forest, samples["lon"].to_numpy(), samples["lat"].to_numpy())
     samples = samples.assign(bosco=flags)
 
     # Raggruppo i campioni consecutivi in bosco in intervalli chilometrici
@@ -321,25 +332,66 @@ def detect_forest(track: pd.DataFrame) -> ForestInfo:
     return ForestInfo(samples=samples, pct=float(flags.mean() * 100), ranges=ranges)
 
 
-def _query_forest(session: requests.Session, chunk: pd.DataFrame) -> set[int]:
-    # Ogni punto è preceduto da un elemento marker "m" con il suo indice:
-    # le aree restituite subito dopo appartengono a quel punto
-    body = "".join(
-        f'make m idx="{row.Index}";out;'
-        f"is_in({row.lat:.6f},{row.lon:.6f});"
-        f'area._[~"^(landuse|natural)$"~"^(forest|wood)$"];out ids;'
-        for row in chunk.itertuples()
+def _fetch_forest_elements(bbox: tuple[float, float, float, float]) -> list[dict]:
+    south, west, north, east = bbox
+    area = f"({south:.6f},{west:.6f},{north:.6f},{east:.6f})"
+    query = (
+        "[out:json][timeout:90];("
+        f'way["landuse"="forest"]{area};way["natural"="wood"]{area};'
+        f'relation["landuse"="forest"]{area};relation["natural"="wood"]{area};'
+        ");out geom;"
     )
-    try:
-        resp = session.post(OVERPASS_API, data={"data": f"[out:json][timeout:120];{body}"}, timeout=180)
-        resp.raise_for_status()
-        elements = resp.json().get("elements", [])
-    except (requests.RequestException, ValueError) as exc:
-        raise BRouterError(f"Overpass non disponibile: {exc}") from exc
+    # Pochi retry per istanza: se una è giù conviene passare subito alla successiva
+    session = http_session(retries=1)
+    errors: list[str] = []
+    for url in OVERPASS_ENDPOINTS:
+        try:
+            resp = session.post(url, data={"data": query}, timeout=120)
+            resp.raise_for_status()
+            data = resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            errors.append(f"{urlparse(url).hostname}: {type(exc).__name__}")
+            continue
+        # Overpass segnala timeout e sovraccarico in "remark" con risposta 200
+        remark = data.get("remark", "")
+        if "error" in remark.lower():
+            errors.append(f"{urlparse(url).hostname}: {remark[:80]}")
+            continue
+        return data.get("elements", [])
+    raise BRouterError("nessuna istanza Overpass disponibile (" + "; ".join(errors) + ")")
 
-    markers = [int(e["tags"]["idx"]) if "idx" in e.get("tags", {}) else None for e in elements]
-    owners = list(accumulate(markers, lambda prev, cur: cur if cur is not None else prev))
-    return {owner for e, owner in zip(elements, owners) if e.get("type") == "area" and owner is not None}
+
+def forest_geometry(elements: list[dict]):
+    """
+    Unione dei poligoni boscati da una risposta Overpass "out geom", o None se non ce ne sono.
+
+    Le way chiuse sono poligoni diretti; per le relazioni multipolygon ricompongo gli anelli
+    outer/inner con polygonize, perché ogni anello può essere spezzato su più way.
+    """
+    def line(points: list[dict]) -> list[tuple[float, float]]:
+        return [(p["lon"], p["lat"]) for p in points]
+
+    def rings(members: list[dict], role: str):
+        lines = [LineString(line(m["geometry"])) for m in members
+                 if m.get("type") == "way" and m.get("role", "outer") in role and len(m.get("geometry", [])) >= 2]
+        return unary_union(list(polygonize(unary_union(lines)))) if lines else None
+
+    closed_ways = [
+        Polygon(line(e["geometry"])) for e in elements
+        if e.get("type") == "way" and len(e.get("geometry", [])) >= 4 and e["geometry"][0] == e["geometry"][-1]
+    ]
+
+    def relation_polygon(rel: dict):
+        outer = rings(rel.get("members", []), ("outer", ""))
+        if outer is None or outer.is_empty:
+            return None
+        inner = rings(rel.get("members", []), ("inner",))
+        return outer.difference(inner) if inner is not None and not inner.is_empty else outer
+
+    relations = [relation_polygon(e) for e in elements if e.get("type") == "relation"]
+    # buffer(0) ripara i poligoni OSM non validi (autointersezioni) prima dell'unione
+    polygons = [p.buffer(0) for p in (*closed_ways, *relations) if p is not None and not p.is_empty]
+    return unary_union(polygons) if polygons else None
 
 
 # ----------------------------------------------------------------------------------------
