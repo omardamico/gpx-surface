@@ -4,6 +4,7 @@ Analisi del fondo di un percorso tramite BRouter. Avvio: streamlit run app.py
 from __future__ import annotations
 
 import html
+import os
 from dataclasses import dataclass
 from datetime import date, time, timedelta
 
@@ -81,7 +82,7 @@ def cached_weather(lat: float, lon: float, day: date, start: time, duration_s: f
 
 def render_toolbar() -> tuple[bc.RouteRequest | None, Options]:
     """Barra comandi; restituisce la richiesta solo quando si preme Analizza."""
-    c_src, c_input, c_opts, c_go = st.columns([1.2, 4.4, 0.9, 0.9], vertical_alignment="bottom")
+    c_src, c_input, c_opts, c_forest, c_go = st.columns([1.2, 4.0, 0.9, 1.1, 0.9], vertical_alignment="bottom")
 
     source = c_src.radio("Sorgente", ["File GPX", "Link BRouter-Web"], label_visibility="collapsed")
     is_gpx = source == "File GPX"
@@ -97,11 +98,12 @@ def render_toolbar() -> tuple[bc.RouteRequest | None, Options]:
     with c_opts.popover("Opzioni"):
         spacing = st.slider("Punti di aggancio GPX ogni (m)", 50, 500, 150, 25, disabled=not is_gpx,
                             help="Più è basso, più il percorso ricalcolato segue fedelmente la traccia.")
-        with_forest = st.checkbox("Rileva tratti nel bosco", value=True,
-                                  help="Interroga OpenStreetMap (Overpass) per landuse=forest e natural=wood.")
         climb_threshold = st.slider("Dislivello minimo di una salita (m)", 5, 50, int(bc.CLIMB_THRESHOLD_M), 5,
                                     help="Saliscendi più piccoli non spezzano una salita. Si applica subito, "
                                          "senza ricalcolare il percorso.")
+    # Disattivato di default: interroga Overpass e allunga i tempi di analisi
+    with_forest = c_forest.checkbox("🌲 Rileva bosco", value=False,
+                                    help="Cerca su OpenStreetMap i tratti nel bosco. Richiede qualche secondo in più.")
     options = Options(with_forest=with_forest, climb_threshold_m=float(climb_threshold))
 
     if not c_go.button("Analizza", type="primary"):
@@ -262,11 +264,15 @@ def render_climbs(climbs: pd.DataFrame) -> None:
     st.markdown("\n\n".join(bc.describe_climbs(climbs)))
 
 
-def _secret_key() -> str | None:
+def _secret(name: str) -> str | None:
     try:
-        return st.secrets.get("GEMINI_API_KEY")
+        return st.secrets.get(name) or os.getenv(name)
     except Exception:  # nessun secrets.toml presente
-        return None
+        return os.getenv(name)
+
+
+def _secret_key() -> str | None:
+    return _secret("GEMINI_API_KEY")
 
 
 def render_weather(a: bc.RouteAnalysis) -> wx.WeatherInfo | None:
@@ -438,6 +444,8 @@ def render_results(a: bc.RouteAnalysis, options: Options) -> None:
         st.markdown('<div class="br-title">▸ Data</div>', unsafe_allow_html=True)
         st.markdown(bc.narrative(a, options.climb_threshold_m))
         render_surface_legend(bc.breakdown(a.steps, "fondo"))
+        if a.forest is not None and a.forest.source:
+            st.caption(f"Bosco da OpenStreetMap via {a.forest.source} in {bc.fmt_num(a.forest.seconds, 1)} s.")
 
     render_stats(a)
     st.plotly_chart(build_elevation_chart(a, climbs), config={"displayModeBar": False})
@@ -469,9 +477,11 @@ def main() -> None:
         if request is not None:
             with st.spinner("Calcolo del percorso con BRouter…"):
                 st.session_state["analysis"] = run_analysis(request, options.with_forest)
+                # I consigli si riferivano al percorso precedente
+                st.session_state.pop("coach", None)
     except (ValueError, bc.BRouterError) as exc:
         st.error(str(exc))
-        options = Options(with_forest=True, climb_threshold_m=bc.CLIMB_THRESHOLD_M)
+        options = Options(with_forest=False, climb_threshold_m=bc.CLIMB_THRESHOLD_M)
 
     analysis = st.session_state.get("analysis")
     if analysis is None:

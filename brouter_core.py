@@ -11,7 +11,10 @@ quali punti della traccia ci cadono dentro.
 from __future__ import annotations
 
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from functools import reduce
 from urllib.parse import parse_qs, urlparse
 
 import gpxpy
@@ -21,7 +24,7 @@ import requests
 import shapely
 from requests.adapters import HTTPAdapter
 from shapely.geometry import LineString, Polygon
-from shapely.ops import polygonize, unary_union
+from shapely.ops import polygonize
 from urllib3.util.retry import Retry
 
 BROUTER_API = "https://brouter.de/brouter"
@@ -42,6 +45,9 @@ FOOT_PROFILE = "hiking-mountain"
 FOREST_SAMPLE_M = 50
 FOREST_MAX_SAMPLES = 600
 FOREST_BBOX_PAD_DEG = 0.002
+# Connessione e lettura: meglio passare presto a un'altra istanza che restare appesi
+OVERPASS_TIMEOUT_S = (5, 35)
+OVERPASS_SERVER_TIMEOUT_S = 30
 
 EARTH_RADIUS_M = 6_371_008.8
 
@@ -149,6 +155,15 @@ class ForestInfo:
     samples: pd.DataFrame
     pct: float
     ranges: tuple[tuple[float, float], ...]
+    source: str = ""
+    seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class ForestShape:
+    """Area boscata: poligoni esterni ed eventuali radure interne (inner delle multipolygon)."""
+    outer: object
+    inner: object | None = None
 
 
 @dataclass(frozen=True)
@@ -313,12 +328,10 @@ def detect_forest(track: pd.DataFrame) -> ForestInfo:
 
     pad = FOREST_BBOX_PAD_DEG
     bbox = (track["lat"].min() - pad, track["lon"].min() - pad, track["lat"].max() + pad, track["lon"].max() + pad)
-    forest = forest_geometry(_fetch_forest_elements(bbox))
-    if forest is None:
-        flags = np.zeros(len(samples), dtype=bool)
-    else:
-        shapely.prepare(forest)
-        flags = shapely.contains_xy(forest, samples["lon"].to_numpy(), samples["lat"].to_numpy())
+    started = time.monotonic()
+    elements, source = _fetch_forest_elements(bbox)
+    flags = points_in_forest(forest_shapes(elements), samples["lon"].to_numpy(), samples["lat"].to_numpy())
+    elapsed = time.monotonic() - started
     samples = samples.assign(bosco=flags)
 
     # Raggruppo i campioni consecutivi in bosco in intervalli chilometrici
@@ -329,69 +342,95 @@ def detect_forest(track: pd.DataFrame) -> ForestInfo:
         (max(0.0, float(km[s]) - half), min(total_km, float(km[e - 1]) + half))
         for s, e in zip(starts, ends)
     )
-    return ForestInfo(samples=samples, pct=float(flags.mean() * 100), ranges=ranges)
+    return ForestInfo(samples=samples, pct=float(flags.mean() * 100), ranges=ranges, source=source, seconds=elapsed)
 
 
-def _fetch_forest_elements(bbox: tuple[float, float, float, float]) -> list[dict]:
+def _fetch_forest_elements(bbox: tuple[float, float, float, float]) -> tuple[list[dict], str]:
     south, west, north, east = bbox
     area = f"({south:.6f},{west:.6f},{north:.6f},{east:.6f})"
     query = (
-        "[out:json][timeout:90];("
+        f"[out:json][timeout:{OVERPASS_SERVER_TIMEOUT_S}];("
         f'way["landuse"="forest"]{area};way["natural"="wood"]{area};'
         f'relation["landuse"="forest"]{area};relation["natural"="wood"]{area};'
         ");out geom;"
     )
-    # Pochi retry per istanza: se una è giù conviene passare subito alla successiva
-    session = http_session(retries=1)
+    # Interrogo tutte le istanze in parallelo e tengo la prima risposta valida:
+    # il tempo di attesa diventa quello dell'istanza più veloce, non la somma dei fallimenti
     errors: list[str] = []
-    for url in OVERPASS_ENDPOINTS:
-        try:
-            resp = session.post(url, data={"data": query}, timeout=120)
-            resp.raise_for_status()
-            data = resp.json()
-        except (requests.RequestException, ValueError) as exc:
-            errors.append(f"{urlparse(url).hostname}: {type(exc).__name__}")
-            continue
-        # Overpass segnala timeout e sovraccarico in "remark" con risposta 200
-        remark = data.get("remark", "")
-        if "error" in remark.lower():
-            errors.append(f"{urlparse(url).hostname}: {remark[:80]}")
-            continue
-        return data.get("elements", [])
+    pool = ThreadPoolExecutor(max_workers=len(OVERPASS_ENDPOINTS))
+    try:
+        futures = {pool.submit(_query_overpass, url, query): url for url in OVERPASS_ENDPOINTS}
+        for future in as_completed(futures):
+            host = urlparse(futures[future]).hostname
+            try:
+                return future.result(), host
+            except BRouterError as exc:
+                errors.append(f"{host}: {exc}")
+    finally:
+        # Non aspetto le istanze più lente: le loro risposte vengono semplicemente ignorate
+        pool.shutdown(wait=False, cancel_futures=True)
     raise BRouterError("nessuna istanza Overpass disponibile (" + "; ".join(errors) + ")")
 
 
-def forest_geometry(elements: list[dict]):
+def _query_overpass(url: str, query: str) -> list[dict]:
     """
-    Unione dei poligoni boscati da una risposta Overpass "out geom", o None se non ce ne sono.
+    Esegue la query su una singola istanza Overpass.
+
+    @throws BRouterError se l'istanza non risponde o segnala un errore
+    """
+    try:
+        resp = http_session(retries=0).post(url, data={"data": query}, timeout=OVERPASS_TIMEOUT_S)
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise BRouterError(type(exc).__name__) from exc
+    # Overpass segnala timeout e sovraccarico in "remark" con risposta 200
+    remark = data.get("remark", "")
+    if "error" in remark.lower():
+        raise BRouterError(remark[:80])
+    return data.get("elements", [])
+
+
+def forest_shapes(elements: list[dict]) -> list[ForestShape]:
+    """
+    Aree boscate da una risposta Overpass "out geom".
 
     Le way chiuse sono poligoni diretti; per le relazioni multipolygon ricompongo gli anelli
-    outer/inner con polygonize, perché ogni anello può essere spezzato su più way.
+    outer/inner con polygonize, perché ogni anello può essere spezzato su più way. Niente unioni
+    o riparazioni globali: sui boschi grandi costano molto e al test punto-in-poligono non servono.
     """
     def line(points: list[dict]) -> list[tuple[float, float]]:
         return [(p["lon"], p["lat"]) for p in points]
 
-    def rings(members: list[dict], role: str):
+    def rings(members: list[dict], roles: tuple[str, ...]):
         lines = [LineString(line(m["geometry"])) for m in members
-                 if m.get("type") == "way" and m.get("role", "outer") in role and len(m.get("geometry", [])) >= 2]
-        return unary_union(list(polygonize(unary_union(lines)))) if lines else None
+                 if m.get("type") == "way" and m.get("role", "outer") in roles and len(m.get("geometry", [])) >= 2]
+        polygons = list(polygonize(lines)) if lines else []
+        return shapely.MultiPolygon(polygons) if polygons else None
 
-    closed_ways = [
-        Polygon(line(e["geometry"])) for e in elements
+    ways = [
+        ForestShape(outer=Polygon(line(e["geometry"]))) for e in elements
         if e.get("type") == "way" and len(e.get("geometry", [])) >= 4 and e["geometry"][0] == e["geometry"][-1]
     ]
+    relations = [
+        ForestShape(outer=outer, inner=rings(e.get("members", []), ("inner",)))
+        for e in elements if e.get("type") == "relation"
+        for outer in [rings(e.get("members", []), ("outer", ""))] if outer is not None
+    ]
+    return ways + relations
 
-    def relation_polygon(rel: dict):
-        outer = rings(rel.get("members", []), ("outer", ""))
-        if outer is None or outer.is_empty:
-            return None
-        inner = rings(rel.get("members", []), ("inner",))
-        return outer.difference(inner) if inner is not None and not inner.is_empty else outer
 
-    relations = [relation_polygon(e) for e in elements if e.get("type") == "relation"]
-    # buffer(0) ripara i poligoni OSM non validi (autointersezioni) prima dell'unione
-    polygons = [p.buffer(0) for p in (*closed_ways, *relations) if p is not None and not p.is_empty]
-    return unary_union(polygons) if polygons else None
+def points_in_forest(shapes: list[ForestShape], lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
+    """True per i punti dentro almeno un'area boscata e fuori dalle sue radure."""
+    def inside(shape: ForestShape) -> np.ndarray:
+        shapely.prepare(shape.outer)
+        mask = shapely.contains_xy(shape.outer, lon, lat)
+        if shape.inner is not None and mask.any():
+            shapely.prepare(shape.inner)
+            mask &= ~shapely.contains_xy(shape.inner, lon, lat)
+        return mask
+
+    return reduce(np.logical_or, (inside(s) for s in shapes), np.zeros(len(lon), dtype=bool))
 
 
 # ----------------------------------------------------------------------------------------
