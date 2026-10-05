@@ -8,3 +8,4 @@ numpy>=1.26
 requests>=2.31
 shapely>=2.0
 matplotlib>=3.8
+pyarrow<25
